@@ -947,20 +947,40 @@ with tab2:
             
             with col1:
                 if st.button("🔍 Compare files and find relationships"):
-                    st.session_state.chat_history.append({"role": "user", "content": "Compare my uploaded files and identify the relationships between them. What patterns do you see?"})
+                    question = "Compare my uploaded files and identify the relationships between them. What patterns do you see?"
+                    st.session_state.chat_history.append({"role": "user", "content": question})
+                    # Generate bot response
+                    with st.spinner("🤔 Analyzing relationships..."):
+                        bot_response = chat_with_bot(question)
+                        st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                     st.rerun()
                 
                 if st.button("📊 Find discrepancies across files"):
-                    st.session_state.chat_history.append({"role": "user", "content": "Are there any discrepancies or inconsistencies between my files? What should I investigate?"})
+                    question = "Are there any discrepancies or inconsistencies between my files? What should I investigate?"
+                    st.session_state.chat_history.append({"role": "user", "content": question})
+                    # Generate bot response
+                    with st.spinner("🤔 Analyzing discrepancies..."):
+                        bot_response = chat_with_bot(question)
+                        st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                     st.rerun()
             
             with col2:
                 if st.button("💰 Analyze financial trends across files"):
-                    st.session_state.chat_history.append({"role": "user", "content": "Analyze financial trends across all my files. What insights can you provide?"})
+                    question = "Analyze financial trends across all my files. What insights can you provide?"
+                    st.session_state.chat_history.append({"role": "user", "content": question})
+                    # Generate bot response
+                    with st.spinner("🤔 Analyzing trends..."):
+                        bot_response = chat_with_bot(question)
+                        st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                     st.rerun()
                 
                 if st.button("🎯 Identify consolidation opportunities"):
-                    st.session_state.chat_history.append({"role": "user", "content": "Based on the relationships between my files, what consolidation or data integration opportunities do you see?"})
+                    question = "Based on the relationships between my files, what consolidation or data integration opportunities do you see?"
+                    st.session_state.chat_history.append({"role": "user", "content": question})
+                    # Generate bot response
+                    with st.spinner("🤔 Finding opportunities..."):
+                        bot_response = chat_with_bot(question)
+                        st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                     st.rerun()
         
         st.markdown("**📈 Single File Analysis:**")
@@ -968,20 +988,40 @@ with tab2:
         
         with col1:
             if st.button("💰 What are the revenue trends?"):
-                st.session_state.chat_history.append({"role": "user", "content": "What are the revenue trends?"})
+                question = "What are the revenue trends?"
+                st.session_state.chat_history.append({"role": "user", "content": question})
+                # Generate bot response
+                with st.spinner("🤔 Analyzing revenue..."):
+                    bot_response = chat_with_bot(question)
+                    st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                 st.rerun()
             
             if st.button("📈 Calculate profit margins"):
-                st.session_state.chat_history.append({"role": "user", "content": "Calculate profit margins from the data"})
+                question = "Calculate profit margins from the data"
+                st.session_state.chat_history.append({"role": "user", "content": question})
+                # Generate bot response
+                with st.spinner("🤔 Calculating margins..."):
+                    bot_response = chat_with_bot(question)
+                    st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                 st.rerun()
         
         with col2:
             if st.button("🔍 Identify key financial metrics"):
-                st.session_state.chat_history.append({"role": "user", "content": "What are the key financial metrics I should focus on?"})
+                question = "What are the key financial metrics I should focus on?"
+                st.session_state.chat_history.append({"role": "user", "content": question})
+                # Generate bot response
+                with st.spinner("🤔 Identifying metrics..."):
+                    bot_response = chat_with_bot(question)
+                    st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                 st.rerun()
             
             if st.button("⚠️ Find potential risks"):
-                st.session_state.chat_history.append({"role": "user", "content": "What potential financial risks can you identify?"})
+                question = "What potential financial risks can you identify?"
+                st.session_state.chat_history.append({"role": "user", "content": question})
+                # Generate bot response
+                with st.spinner("🤔 Assessing risks..."):
+                    bot_response = chat_with_bot(question)
+                    st.session_state.chat_history.append({"role": "assistant", "content": bot_response})
                 st.rerun()
 
 # Tab 3: Relationship Analysis
