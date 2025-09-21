@@ -1,0 +1,9 @@
+agno
+flask
+pandas
+openpyxl
+pymilvus
+requests
+streamlit
+ollama
+numpy
