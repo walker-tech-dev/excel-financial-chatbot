@@ -797,23 +797,32 @@ def chat_with_bot(user_question):
                 relevant_chunks = search_milvus_for_context(
                     st.session_state.milvus_collection, 
                     query_embedding, 
-                    top_k=5
+                    top_k=10  # Increased from 5 to get more results
                 )
                 
                 if relevant_chunks:
                     context_parts.append("📋 Relevant data from your files:")
-                    for i, chunk in enumerate(relevant_chunks[:3], 1):  # Top 3 most relevant
+                    for i, chunk in enumerate(relevant_chunks[:5], 1):  # Show top 5
                         context_parts.append(f"""
                         📄 **{chunk['filename']}** (Sheet: {chunk['sheet_name']})
-                        Similarity: {chunk['similarity']:.2f}
-                        Data: {chunk['text'][:300]}...
+                        Similarity: {chunk['similarity']:.3f}
+                        Row: {chunk['row_number']}
+                        Data: {chunk['text'][:500]}...
                         """)
+                        
+                    # If no high-similarity chunks, show all chunks for debugging
+                    high_sim_chunks = [c for c in relevant_chunks if c['similarity'] > 0.3]
+                    if not high_sim_chunks:
+                        st.warning("⚠️ No high-similarity chunks found. Showing all available chunks:")
+                        context_parts.append("\n🔍 **All available chunks:**")
+                        for i, chunk in enumerate(relevant_chunks, 1):
+                            context_parts.append(f"Chunk {i}: {chunk['filename']} - Sim: {chunk['similarity']:.3f}")
                 else:
-                    context_parts.append("⚠️ No directly relevant data found in your files for this query.")
+                    context_parts.append("⚠️ No chunks returned from Milvus search.")
                     
             except Exception as e:
                 st.warning(f"Milvus search failed: {e}, falling back to session data")
-                # Fallback to session state if Milvus fails
+                relevant_chunks = []
                 
         # Fallback: Add general context from session state if no Milvus results or search fails
         if (not relevant_chunks or len(relevant_chunks) == 0) and st.session_state.excel_uploaded and st.session_state.processed_data:
@@ -825,13 +834,48 @@ def chat_with_bot(user_question):
             
             # Add actual sample data from each file (up to 3 files)
             context_parts.append("\n📄 Sample data from your files:")
-            for i, (sheet_name, data) in enumerate(list(st.session_state.processed_data.items())[:3]):
+            
+            # Prioritize revenue-related files
+            revenue_keywords = ['revenue', 'sales', 'income', 'profit', 'amount']
+            prioritized_data = []
+            other_data = []
+            
+            for sheet_name, data in st.session_state.processed_data.items():
+                df = data['dataframe']
+                columns_str = ' '.join(df.columns.tolist()).lower()
+                filename_str = data['filename'].lower()
+                
+                # Check if this file likely contains revenue data
+                has_revenue = any(keyword in columns_str or keyword in filename_str for keyword in revenue_keywords)
+                
+                if has_revenue:
+                    prioritized_data.append((sheet_name, data))
+                else:
+                    other_data.append((sheet_name, data))
+            
+            # Show revenue-related files first, then others
+            all_data = prioritized_data + other_data
+            
+            for i, (sheet_name, data) in enumerate(all_data[:4]):  # Show up to 4 files
                 df = data['dataframe']
                 context_parts.append(f"\n**{data['filename']} - {sheet_name}:**")
                 context_parts.append(f"Columns: {', '.join(df.columns.tolist())}")
                 # Add first 5 rows of actual data
                 sample_data = df.head(5).to_string(index=False)
                 context_parts.append(f"Sample data:\n{sample_data}")
+                
+                # If this looks like revenue data, add more context
+                if any(keyword in ' '.join(df.columns.tolist()).lower() for keyword in revenue_keywords):
+                    # Try to find revenue-related statistics
+                    numeric_cols = df.select_dtypes(include=['number']).columns
+                    if len(numeric_cols) > 0:
+                        context_parts.append(f"📊 Numeric column summary:")
+                        for col in numeric_cols[:3]:  # First 3 numeric columns
+                            if 'revenue' in col.lower() or 'amount' in col.lower() or 'sales' in col.lower():
+                                max_val = df[col].max()
+                                min_val = df[col].min()
+                                mean_val = df[col].mean()
+                                context_parts.append(f"  {col}: Max={max_val:,.2f}, Min={min_val:,.2f}, Avg={mean_val:,.2f}")
             
             # Add relationship information
             if st.session_state.file_relationships:
