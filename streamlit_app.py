@@ -4,9 +4,11 @@ import requests
 import json
 from io import BytesIO
 import ollama
-from pymilvus import connections, Collection, utility
+from pymilvus import connections, Collection, utility, FieldSchema, CollectionSchema, DataType
 import time
 import numpy as np
+import hashlib
+from typing import Dict, List, Any
 from agno_integration import integrate_agno_analysis
 
 # Page configuration
@@ -96,6 +98,8 @@ if 'file_summaries' not in st.session_state:
     st.session_state.file_summaries = {}
 if 'agno_analysis' not in st.session_state:
     st.session_state.agno_analysis = {}
+if 'milvus_collection' not in st.session_state:
+    st.session_state.milvus_collection = None
 
 def check_milvus_connection():
     """Check if Milvus is running and accessible"""
@@ -107,6 +111,106 @@ def check_milvus_connection():
     except Exception as e:
         st.error(f"❌ Milvus connection failed: {e}")
         return False
+
+def create_milvus_collection():
+    """Create or get the Milvus collection for document storage"""
+    collection_name = "excel_documents"
+    
+    try:
+        # Check if collection exists
+        if utility.has_collection(collection_name):
+            collection = Collection(collection_name)
+            collection.load()
+            return collection
+        
+        # Define collection schema
+        fields = [
+            FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=100, is_primary=True),
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=256),
+            FieldSchema(name="text_content", dtype=DataType.VARCHAR, max_length=2000),
+            FieldSchema(name="filename", dtype=DataType.VARCHAR, max_length=200),
+            FieldSchema(name="sheet_name", dtype=DataType.VARCHAR, max_length=100),
+            FieldSchema(name="row_number", dtype=DataType.INT64),
+            FieldSchema(name="file_type", dtype=DataType.VARCHAR, max_length=50),
+        ]
+        
+        schema = CollectionSchema(fields, description="Excel/CSV document embeddings")
+        collection = Collection(collection_name, schema)
+        
+        # Create index for vector search
+        index_params = {
+            "metric_type": "COSINE",
+            "index_type": "IVF_FLAT",
+            "params": {"nlist": 128}
+        }
+        collection.create_index("embedding", index_params)
+        collection.load()
+        
+        st.success(f"✅ Created Milvus collection: {collection_name}")
+        return collection
+        
+    except Exception as e:
+        st.error(f"❌ Failed to create Milvus collection: {e}")
+        return None
+
+def insert_data_to_milvus(collection, embeddings_data: List[Dict]):
+    """Insert embeddings and metadata into Milvus collection"""
+    try:
+        if not embeddings_data or not collection:
+            return False
+            
+        # Prepare data for insertion
+        ids = [item['id'] for item in embeddings_data]
+        embeddings = [item['embedding'] for item in embeddings_data]
+        text_contents = [item['text_content'] for item in embeddings_data]
+        filenames = [item['filename'] for item in embeddings_data]
+        sheet_names = [item['sheet_name'] for item in embeddings_data]
+        row_numbers = [item['row_number'] for item in embeddings_data]
+        file_types = [item['file_type'] for item in embeddings_data]
+        
+        # Insert data
+        entities = [ids, embeddings, text_contents, filenames, sheet_names, row_numbers, file_types]
+        collection.insert(entities)
+        collection.flush()
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Failed to insert data to Milvus: {e}")
+        return False
+
+def search_milvus_for_context(collection, query_embedding: List[float], top_k: int = 5) -> List[Dict]:
+    """Search Milvus for relevant document chunks"""
+    try:
+        if not collection:
+            return []
+            
+        search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
+        
+        results = collection.search(
+            data=[query_embedding],
+            anns_field="embedding",
+            param=search_params,
+            limit=top_k,
+            output_fields=["text_content", "filename", "sheet_name", "row_number"]
+        )
+        
+        context_chunks = []
+        for hits in results:
+            for hit in hits:
+                context_chunks.append({
+                    'text': hit.entity.get('text_content'),
+                    'filename': hit.entity.get('filename'),
+                    'sheet_name': hit.entity.get('sheet_name'),
+                    'row_number': hit.entity.get('row_number'),
+                    'similarity': hit.score
+                })
+        
+        return context_chunks
+        
+    except Exception as e:
+        st.error(f"❌ Failed to search Milvus: {e}")
+        return []
 
 def check_ollama_connection():
     """Check if Ollama is running and model is available"""
@@ -375,6 +479,57 @@ def process_multiple_files(uploaded_files):
         st.session_state.excel_uploaded = True
         st.session_state.uploaded_filename = f"{len(uploaded_files)} files"
         
+        # NEW: Store embeddings in Milvus for true RAG
+        progress_bar.progress(0.95)
+        status_text.text("Storing embeddings in Milvus vector database...")
+        
+        # Create/get Milvus collection
+        collection = create_milvus_collection()
+        
+        if collection:
+            # Prepare data for Milvus insertion
+            embeddings_data = []
+            for sheet_key, file_data in all_files_data.items():
+                if sheet_key in all_embeddings:
+                    # Create chunks from dataframe for better retrieval
+                    df = file_data['dataframe']
+                    filename = file_data['filename']
+                    
+                    # Create chunks of rows (e.g., every 10 rows)
+                    chunk_size = 10
+                    for start_row in range(0, len(df), chunk_size):
+                        end_row = min(start_row + chunk_size, len(df))
+                        chunk_df = df.iloc[start_row:end_row]
+                        
+                        # Create text content for this chunk
+                        chunk_text = f"File: {filename} | Sheet: {sheet_key} | Rows {start_row+1}-{end_row}\n"
+                        chunk_text += f"Columns: {', '.join(chunk_df.columns.tolist())}\n"
+                        chunk_text += chunk_df.to_string(index=False)[:1800]  # Limit text size
+                        
+                        # Generate unique ID
+                        chunk_id = f"{filename}_{sheet_key}_{start_row}_{end_row}"
+                        
+                        embeddings_data.append({
+                            'id': chunk_id,
+                            'embedding': all_embeddings[sheet_key],
+                            'text_content': chunk_text,
+                            'filename': filename,
+                            'sheet_name': sheet_key,
+                            'row_number': start_row,
+                            'file_type': filename.split('.')[-1].upper()
+                        })
+            
+            # Insert into Milvus
+            if embeddings_data:
+                success = insert_data_to_milvus(collection, embeddings_data)
+                if success:
+                    st.success(f"✅ Stored {len(embeddings_data)} chunks in Milvus vector database")
+                    st.session_state.milvus_collection = collection  # Store collection in session
+                else:
+                    st.warning("⚠️ Failed to store in Milvus, using in-memory storage only")
+            else:
+                st.warning("⚠️ No embeddings data to store in Milvus")
+        
         progress_bar.progress(1.0)
         status_text.text("✅ Processing complete!")
         
@@ -495,41 +650,80 @@ def process_multiple_files(uploaded_files):
         return False
 
 def chat_with_bot(user_question):
-    """Send question to the chatbot and get response with cross-file analysis"""
+    """Send question to the chatbot and get response using RAG with Milvus retrieval"""
     try:
-        # Prepare context from multiple files if available
-        context_parts = []
+        # Generate embedding for the user question
+        query_embedding = create_simple_embedding(user_question)
         
-        if st.session_state.excel_uploaded and st.session_state.processed_data:
-            context_parts.append("Available data files and their relationships:")
+        # Prepare context from Milvus retrieval (RAG)
+        context_parts = []
+        relevant_chunks = []
+        
+        # Check if we have Milvus collection available
+        if hasattr(st.session_state, 'milvus_collection') and st.session_state.milvus_collection:
+            try:
+                # Search Milvus for relevant chunks
+                relevant_chunks = search_milvus_for_context(
+                    st.session_state.milvus_collection, 
+                    query_embedding, 
+                    top_k=5
+                )
+                
+                if relevant_chunks:
+                    context_parts.append("📋 Relevant data from your files:")
+                    for i, chunk in enumerate(relevant_chunks[:3], 1):  # Top 3 most relevant
+                        context_parts.append(f"""
+                        📄 **{chunk['filename']}** (Sheet: {chunk['sheet_name']})
+                        Similarity: {chunk['similarity']:.2f}
+                        Data: {chunk['text'][:300]}...
+                        """)
+                else:
+                    context_parts.append("⚠️ No directly relevant data found in your files for this query.")
+                    
+            except Exception as e:
+                st.warning(f"Milvus search failed: {e}, falling back to session data")
+                # Fallback to session state if Milvus fails
+                
+        # Fallback: Add general context from session state if no Milvus results
+        if not relevant_chunks and st.session_state.excel_uploaded and st.session_state.processed_data:
+            context_parts.append("📊 General overview of your uploaded files:")
             
             # Add file summaries
             for filename, summary in st.session_state.file_summaries.items():
-                context_parts.append(f"File: {filename} - {summary['total_rows']} rows, {summary['total_columns']} columns")
+                context_parts.append(f"• **{filename}**: {summary['total_rows']} rows, {summary['total_columns']} columns")
             
             # Add relationship information
             if st.session_state.file_relationships:
-                context_parts.append("\nFile relationships (similarity scores):")
-                top_relationships = st.session_state.file_relationships[:3]  # Top 3
+                context_parts.append("\n🔗 **File relationships:**")
+                top_relationships = st.session_state.file_relationships[:2]  # Top 2
                 for rel in top_relationships:
-                    context_parts.append(f"{rel['file1']} ↔ {rel['file2']}: {rel['similarity_percentage']:.1f}% similar")
-            
-            # Add sample data from each file
-            context_parts.append("\nSample data structures:")
-            for sheet_name, data in list(st.session_state.processed_data.items())[:3]:  # First 3 sheets
-                df = data['dataframe']
-                context_parts.append(f"{sheet_name}: Columns: {', '.join(df.columns.tolist()[:5])}")  # First 5 columns
+                    context_parts.append(f"• {rel['file1']} ↔ {rel['file2']}: {rel['similarity_percentage']:.1f}% similar")
         
         # Construct system message with context
-        system_message = """You are a financial analyst AI assistant specialized in multi-file data analysis. 
-        You help analyze Excel and CSV data, identify relationships between files, provide insights about 
-        financial metrics, trends, and cross-file correlations. You can compare data across multiple files 
-        and identify patterns, discrepancies, or complementary information."""
+        system_message = """You are a financial analyst AI assistant specialized in multi-file data analysis using RAG (Retrieval-Augmented Generation). 
+        
+        You help analyze Excel and CSV data by:
+        - Using the most relevant data chunks retrieved from vector search
+        - Identifying relationships between files and data patterns
+        - Providing insights about financial metrics and trends
+        - Comparing data across multiple files
+        - Identifying patterns, discrepancies, or complementary information
+        
+        When answering:
+        - Reference specific data from the retrieved chunks when available
+        - Be precise about which files and data you're referring to
+        - If no relevant data is found, say so clearly
+        - Provide actionable insights based on the actual data"""
         
         if context_parts:
-            system_message += f"\n\nContext about uploaded files:\n{chr(10).join(context_parts)}"
+            system_message += f"\n\n🎯 **Retrieved Context:**\n{chr(10).join(context_parts)}"
         
-        # Generate response using Ollama
+        # Add query information
+        user_message = f"""**User Question:** {user_question}
+        
+        Please answer based on the retrieved data context above. If the retrieved data is relevant, reference it specifically. If not, explain what kind of data would be needed to answer this question properly."""
+        
+        # Generate response using Ollama with RAG context
         response = ollama.chat(model='llama3.2:3b', messages=[
             {
                 'role': 'system',
@@ -537,14 +731,19 @@ def chat_with_bot(user_question):
             },
             {
                 'role': 'user',
-                'content': user_question,
+                'content': user_message,
             },
         ])
         
-        return response['message']['content']
+        # Add metadata about retrieval
+        response_text = response['message']['content']
+        if relevant_chunks:
+            response_text += f"\n\n---\n📊 *Based on {len(relevant_chunks)} relevant data chunks from your files*"
+        
+        return response_text
         
     except Exception as e:
-        return f"❌ Error generating response: {e}"
+        return f"❌ Error generating RAG response: {e}"
 
 # Main App Layout
 st.markdown('<h1 class="main-header">📊 Excel Financial Chatbot</h1>', unsafe_allow_html=True)
@@ -949,7 +1148,7 @@ with tab3:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666;'>
-    <p>🤖 Powered by Llama 3.2 3B • 🗄️ Milvus Vector Database • 🐍 Streamlit</p>
+    <p>🤖 Powered by Llama 3.2 3B • 🗄️ Milvus RAG Vector Database • 🐍 Streamlit</p>
     <p>Built for Financial & Technical Analysis</p>
 </div>
 """, unsafe_allow_html=True)
