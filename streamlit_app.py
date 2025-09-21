@@ -117,19 +117,18 @@ def create_milvus_collection():
     collection_name = "excel_documents"
     
     try:
-        # Check if collection exists
+        # Drop existing collection if it exists (to update schema)
         if utility.has_collection(collection_name):
-            collection = Collection(collection_name)
-            collection.load()
-            return collection
+            st.info(f"🔄 Updating Milvus collection schema...")
+            utility.drop_collection(collection_name)
         
-        # Define collection schema
+        # Define collection schema with increased limits
         fields = [
             FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=100, is_primary=True),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=256),
-            FieldSchema(name="text_content", dtype=DataType.VARCHAR, max_length=2000),
-            FieldSchema(name="filename", dtype=DataType.VARCHAR, max_length=200),
-            FieldSchema(name="sheet_name", dtype=DataType.VARCHAR, max_length=100),
+            FieldSchema(name="text_content", dtype=DataType.VARCHAR, max_length=3000),  # Increased from 2000
+            FieldSchema(name="filename", dtype=DataType.VARCHAR, max_length=300),      # Increased from 200
+            FieldSchema(name="sheet_name", dtype=DataType.VARCHAR, max_length=150),    # Increased from 100
             FieldSchema(name="row_number", dtype=DataType.INT64),
             FieldSchema(name="file_type", dtype=DataType.VARCHAR, max_length=50),
         ]
@@ -154,29 +153,86 @@ def create_milvus_collection():
         return None
 
 def insert_data_to_milvus(collection, embeddings_data: List[Dict]):
-    """Insert embeddings and metadata into Milvus collection"""
+    """Insert embeddings and metadata into Milvus collection with validation"""
     try:
         if not embeddings_data or not collection:
             return False
+        
+        # Validate data before insertion
+        validated_data = []
+        for i, item in enumerate(embeddings_data):
+            try:
+                # Validate text content length
+                text_content = item['text_content']
+                if len(text_content) > 3000:
+                    text_content = text_content[:2950] + "..."
+                    st.warning(f"⚠️ Truncated text content for chunk {i+1} (was {len(item['text_content'])} chars)")
+                
+                # Validate filename length
+                filename = item['filename']
+                if len(filename) > 300:
+                    filename = filename[:297] + "..."
+                
+                # Validate sheet name length
+                sheet_name = item['sheet_name']
+                if len(sheet_name) > 150:
+                    sheet_name = sheet_name[:147] + "..."
+                
+                validated_item = {
+                    'id': item['id'],
+                    'embedding': item['embedding'],
+                    'text_content': text_content,
+                    'filename': filename,
+                    'sheet_name': sheet_name,
+                    'row_number': item['row_number'],
+                    'file_type': item['file_type']
+                }
+                validated_data.append(validated_item)
+                
+            except Exception as e:
+                st.warning(f"⚠️ Skipping invalid data chunk {i+1}: {e}")
+                continue
+        
+        if not validated_data:
+            st.error("❌ No valid data to insert into Milvus")
+            return False
             
         # Prepare data for insertion
-        ids = [item['id'] for item in embeddings_data]
-        embeddings = [item['embedding'] for item in embeddings_data]
-        text_contents = [item['text_content'] for item in embeddings_data]
-        filenames = [item['filename'] for item in embeddings_data]
-        sheet_names = [item['sheet_name'] for item in embeddings_data]
-        row_numbers = [item['row_number'] for item in embeddings_data]
-        file_types = [item['file_type'] for item in embeddings_data]
+        ids = [item['id'] for item in validated_data]
+        embeddings = [item['embedding'] for item in validated_data]
+        text_contents = [item['text_content'] for item in validated_data]
+        filenames = [item['filename'] for item in validated_data]
+        sheet_names = [item['sheet_name'] for item in validated_data]
+        row_numbers = [item['row_number'] for item in validated_data]
+        file_types = [item['file_type'] for item in validated_data]
         
-        # Insert data
-        entities = [ids, embeddings, text_contents, filenames, sheet_names, row_numbers, file_types]
-        collection.insert(entities)
+        # Insert data in batches to avoid memory issues
+        batch_size = 100
+        total_inserted = 0
+        
+        for i in range(0, len(validated_data), batch_size):
+            batch_end = min(i + batch_size, len(validated_data))
+            batch_entities = [
+                ids[i:batch_end],
+                embeddings[i:batch_end],
+                text_contents[i:batch_end],
+                filenames[i:batch_end],
+                sheet_names[i:batch_end],
+                row_numbers[i:batch_end],
+                file_types[i:batch_end]
+            ]
+            
+            collection.insert(batch_entities)
+            total_inserted += (batch_end - i)
+            
         collection.flush()
-        
+        st.info(f"📊 Successfully inserted {total_inserted} chunks into Milvus")
         return True
         
     except Exception as e:
         st.error(f"❌ Failed to insert data to Milvus: {e}")
+        # Print more details for debugging
+        st.error(f"Error details: {str(e)}")
         return False
 
 def search_milvus_for_context(collection, query_embedding: List[float], top_k: int = 5) -> List[Dict]:
@@ -501,13 +557,28 @@ def process_multiple_files(uploaded_files):
                         end_row = min(start_row + chunk_size, len(df))
                         chunk_df = df.iloc[start_row:end_row]
                         
-                        # Create text content for this chunk
-                        chunk_text = f"File: {filename} | Sheet: {sheet_key} | Rows {start_row+1}-{end_row}\n"
-                        chunk_text += f"Columns: {', '.join(chunk_df.columns.tolist())}\n"
-                        chunk_text += chunk_df.to_string(index=False)[:1800]  # Limit text size
+                        # Create text content for this chunk with strict length control
+                        header = f"File: {filename} | Sheet: {sheet_key} | Rows {start_row+1}-{end_row}\n"
+                        columns = f"Columns: {', '.join(chunk_df.columns.tolist()[:10])}\n"  # Limit columns
                         
-                        # Generate unique ID
-                        chunk_id = f"{filename}_{sheet_key}_{start_row}_{end_row}"
+                        # Calculate remaining space for data (3000 - header length - safety margin)
+                        header_length = len(header) + len(columns)
+                        max_data_length = 2800 - header_length  # Leave 200 char safety margin
+                        
+                        # Get data content and truncate if necessary
+                        data_content = chunk_df.to_string(index=False)
+                        if len(data_content) > max_data_length:
+                            data_content = data_content[:max_data_length] + "..."
+                        
+                        chunk_text = header + columns + data_content
+                        
+                        # Final safety check - truncate if still too long
+                        if len(chunk_text) > 2950:  # Safety margin for 3000 limit
+                            chunk_text = chunk_text[:2950] + "..."
+                        
+                        # Generate unique ID with hash to avoid length issues
+                        import hashlib
+                        chunk_id = hashlib.md5(f"{filename}_{sheet_key}_{start_row}_{end_row}".encode()).hexdigest()[:50]
                         
                         embeddings_data.append({
                             'id': chunk_id,
