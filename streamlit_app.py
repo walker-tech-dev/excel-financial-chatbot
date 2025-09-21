@@ -236,11 +236,17 @@ def insert_data_to_milvus(collection, embeddings_data: List[Dict]):
         return False
 
 def search_milvus_for_context(collection, query_embedding: List[float], top_k: int = 5) -> List[Dict]:
-    """Search Milvus for relevant document chunks"""
+    """Search Milvus for relevant document chunks with debugging"""
     try:
         if not collection:
+            st.warning("⚠️ No Milvus collection available")
             return []
-            
+        
+        # Check collection stats
+        collection.load()
+        stats = collection.num_entities
+        st.info(f"🔍 Searching {stats} chunks in Milvus...")
+        
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
         
         results = collection.search(
@@ -253,15 +259,26 @@ def search_milvus_for_context(collection, query_embedding: List[float], top_k: i
         
         context_chunks = []
         for hits in results:
-            for hit in hits:
+            st.info(f"📊 Found {len(hits)} potential matches")
+            for i, hit in enumerate(hits):
+                similarity = hit.score
+                # Show similarity scores for debugging
+                if i < 3:  # Show first 3 results
+                    st.info(f"Match {i+1}: Similarity {similarity:.3f}")
+                
                 context_chunks.append({
                     'text': hit.entity.get('text_content'),
                     'filename': hit.entity.get('filename'),
                     'sheet_name': hit.entity.get('sheet_name'),
                     'row_number': hit.entity.get('row_number'),
-                    'similarity': hit.score
+                    'similarity': similarity
                 })
         
+        if not context_chunks:
+            st.warning("⚠️ No matching chunks found in Milvus search")
+        else:
+            st.success(f"✅ Retrieved {len(context_chunks)} chunks from Milvus")
+            
         return context_chunks
         
     except Exception as e:
@@ -311,8 +328,9 @@ def generate_embeddings(text_list, model_name='llama3.2:3b'):
     return embeddings
 
 def create_simple_embedding(text, embedding_size=256):
-    """Create a simple embedding based on text characteristics"""
+    """Create a simple embedding based on text characteristics with focus on financial terms"""
     import hashlib
+    import re
     
     # Convert text to lowercase and get basic stats
     text = str(text).lower()
@@ -337,10 +355,52 @@ def create_simple_embedding(text, embedding_size=256):
     features.append(len(text))   # Character count
     features.append(len(set(words)) / (len(words) or 1))  # Unique word ratio
     
-    # Number-based features (look for financial terms)
-    financial_terms = ['revenue', 'profit', 'cost', 'expense', 'margin', 'sales', 'income']
+    # Enhanced financial and business terms
+    financial_terms = [
+        'revenue', 'profit', 'cost', 'expense', 'margin', 'sales', 'income',
+        'customer', 'product', 'account', 'quarter', 'year', 'region',
+        'performance', 'growth', 'trend', 'analysis', 'data', 'total',
+        'amount', 'value', 'price', 'budget', 'forecast', 'target',
+        'best', 'top', 'highest', 'lowest', 'average', 'maximum', 'minimum'
+    ]
+    
     for term in financial_terms:
         features.append(1.0 if term in text else 0.0)
+    
+    # Number detection features
+    numbers = re.findall(r'\d+', text)
+    features.append(len(numbers))  # Count of numbers
+    if numbers:
+        features.append(float(max(numbers, key=lambda x: int(x))))  # Largest number
+        features.append(float(min(numbers, key=lambda x: int(x))))  # Smallest number
+    else:
+        features.extend([0.0, 0.0])
+    
+    # Column name patterns (common in financial data)
+    column_patterns = [
+        'name', 'id', 'date', 'time', 'amount', 'quantity', 'rate',
+        'percent', 'status', 'type', 'category', 'description'
+    ]
+    
+    for pattern in column_patterns:
+        features.append(1.0 if pattern in text else 0.0)
+    
+    # Pad or truncate to desired size
+    while len(features) < embedding_size:
+        # Use hash to generate additional pseudo-random features
+        hash_value = int(hashlib.md5(f"{text}_{len(features)}".encode()).hexdigest(), 16)
+        features.append((hash_value % 1000) / 1000.0)
+    
+    features = features[:embedding_size]
+    
+    # Normalize the embedding
+    import numpy as np
+    features = np.array(features)
+    norm = np.linalg.norm(features)
+    if norm > 0:
+        features = features / norm
+    
+    return features.tolist()
     
     # Pad or truncate to desired size
     while len(features) < embedding_size:
@@ -755,13 +815,23 @@ def chat_with_bot(user_question):
                 st.warning(f"Milvus search failed: {e}, falling back to session data")
                 # Fallback to session state if Milvus fails
                 
-        # Fallback: Add general context from session state if no Milvus results
-        if not relevant_chunks and st.session_state.excel_uploaded and st.session_state.processed_data:
-            context_parts.append("📊 General overview of your uploaded files:")
+        # Fallback: Add general context from session state if no Milvus results or search fails
+        if (not relevant_chunks or len(relevant_chunks) == 0) and st.session_state.excel_uploaded and st.session_state.processed_data:
+            context_parts.append("📊 Available data from your uploaded files:")
             
-            # Add file summaries
+            # Add file summaries with sample data
             for filename, summary in st.session_state.file_summaries.items():
                 context_parts.append(f"• **{filename}**: {summary['total_rows']} rows, {summary['total_columns']} columns")
+            
+            # Add actual sample data from each file (up to 3 files)
+            context_parts.append("\n📄 Sample data from your files:")
+            for i, (sheet_name, data) in enumerate(list(st.session_state.processed_data.items())[:3]):
+                df = data['dataframe']
+                context_parts.append(f"\n**{data['filename']} - {sheet_name}:**")
+                context_parts.append(f"Columns: {', '.join(df.columns.tolist())}")
+                # Add first 5 rows of actual data
+                sample_data = df.head(5).to_string(index=False)
+                context_parts.append(f"Sample data:\n{sample_data}")
             
             # Add relationship information
             if st.session_state.file_relationships:
